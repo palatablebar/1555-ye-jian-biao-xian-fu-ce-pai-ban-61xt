@@ -59,3 +59,24 @@ def test_changed_profile_fetches_matching_stage():
 def test_capacity_type_check(capacity):
     response = app.test_client().post(ROUTE+'/run',json={'capacity':capacity})
     assert response.status_code == 422
+
+
+def test_correct_endpoint_registers_void_and_issues_voucher():
+    dataset = open_fixture()
+    donor = next(row for row in dataset['records'] if 65 <= row['day'] < 85
+                 and row.get('outcome') is not None and row['received'] < 85
+                 and row.get('result_day', 10**9) < 85)
+    response = app.test_client().post(ROUTE+'/correct', json={**dataset,
+                                      'voids':[{'key':donor['key'],'revision':donor.get('revision',1)}]})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['correction']['scope'] == 'REPLAY_ONLY'
+    assert payload['correction']['status'] == 'ISSUED'
+    assert payload['correction']['base_receipt'] != payload['run_id']
+    register = [row for row in payload['sections'][7]['records'] if row.get('登记') == '作废实绩版次']
+    assert [row['单号'] for row in register] == [donor['key']]
+
+
+def test_correct_endpoint_requires_voids():
+    response = app.test_client().post(ROUTE+'/correct', json=open_fixture())
+    assert response.status_code == 422 and response.get_json()['code'] == 'INVALID_BATCH'

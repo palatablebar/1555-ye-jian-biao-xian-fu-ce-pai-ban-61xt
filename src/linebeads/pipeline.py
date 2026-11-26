@@ -1,4 +1,5 @@
-from dataclasses import replace
+from collections import Counter
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
@@ -10,7 +11,16 @@ from .night_accuracy import service as calibration_service
 from .seasonal_mix import service as monitor_service
 from .retrocheck_slots import service as dispatch_service
 from .marking_evidence import service as audit_service
+from .correction import service as correction_service
+from .correction import contracts as correction_contract
 from .surface_windows import contracts as window_contract
+from .lane_samples.contracts import DecodeResult
+from .surface_windows.contracts import Chronology
+from .reflection_factors.contracts import FeatureState
+from .bead_kernel.contracts import Fit
+from .night_accuracy.contracts import Verification
+from .retrocheck_slots.contracts import Plan
+from .marking_evidence.contracts import BatchReceipt
 
 PRESET = Path(__file__).resolve().parents[2] / 'sample_data' / 'lane_samples_sample.json'
 MODULES = (('lane_samples', '路段测点'),
@@ -81,7 +91,19 @@ def replay_metrics(report):
     return result
 
 
-def execute(documents, capacity=12, mode='balanced', *, as_of=96):
+@dataclass(frozen=True, slots=True)
+class ShiftRun:
+    report: dict
+    intake: DecodeResult
+    windows: Chronology
+    state: FeatureState
+    kernel: Fit
+    verification: Verification
+    allocation: Plan
+    receipt: BatchReceipt
+
+
+def _execute_run(documents, capacity, mode, as_of):
     if type(as_of) is not int or not 91 <= as_of <= 3650:
         raise ValueError('请输入 91 至 3650 之间的整数工日')
     if type(documents) not in (list,tuple):
@@ -162,7 +184,106 @@ def execute(documents, capacity=12, mode='balanced', *, as_of=96):
  'traffic_k': ('日车辆', '千辆'),
  'beads_g': ('玻璃珠投放量', 'g/m²'),
  'surface_c': ('路表温度', '℃')}, 'metrics': overview, 'performance': replay_metrics(performance), 'rows': row_list, 'series': points}
-    return overview_report
+    return ShiftRun(overview_report, intake, windows, state, kernel, fitted_calibration, allocation, closed)
+
+
+def execute(documents, capacity=12, mode='balanced', *, as_of=96):
+    return _execute_run(documents, capacity, mode, as_of).report
+
+
+def _refresh_replay(base, cleaned, mode, as_of):
+    """Recompute replay errors with voided outcomes removed; dispatch stays as issued."""
+    intake = intake_service.load_samples(iter(cleaned), as_of)
+    timeline = window_contract.WindowRule.standard(allow_censor=False)
+    windows = cohort_service.build_windows(intake.entries, replace(timeline, as_of=as_of))
+    features = feature_service.transform_windows(windows, base.state)
+    predictions = model_service.predict(base.kernel, features.replay, base.state.fingerprint)
+    evaluated = calibration_service.validate_predictions(predictions, base.verification)
+    performance = calibration_service.performance(evaluated)
+    receipt = audit_service.close_batch(tuple(cleaned), intake, windows, base.allocation,
+                                        base.state.fingerprint, base.kernel.name, mode)
+    if receipt.decisions != base.receipt.decisions:
+        raise ArithmeticError('回放更正不得改变当班处置')
+    report = dict(base.report)
+    report['run_id'] = receipt.stamp
+    report['sample_hash'] = receipt.batch_hash
+    report['performance'] = replay_metrics(performance)
+    sections = [dict(section) for section in base.report['sections']]
+    sections[1] = dict(sections[1],
+                       summary=f'拟合 {len(windows.train)} 条，校准 {len(windows.calibration)} 条，回放 {len(windows.replay)} 条',
+                       records=cohort_service.window_evidence(windows) + cohort_service.readiness_evidence(windows, as_of))
+    overtime = calibration_service.boundary_diagnostics(evaluated, 25)
+    sector = calibration_service.sector_replay(evaluated, 25)
+    sections[4] = dict(sections[4],
+                       summary=f'{base.verification.method} · {performance.status} · {performance.count} 条回放实绩',
+                       records=calibration_service.calibration_evidence(performance) + [overtime] + sector)
+    field = audit_service.sign_field_evidence(report['rows'], base.allocation)
+    sections[7] = dict(sections[7],
+                       summary=f'处置凭证 {receipt.stamp} · 额度守恒',
+                       records=(audit_service.reconciliation_evidence(receipt) + field['执行业务单']
+                                + audit_service.site_checklist(report['rows'])
+                                + audit_service.intervention_summary(report['rows'])))
+    report['sections'] = sections
+    return report, receipt.stamp
+
+
+def _pause_invalidated(base):
+    """Correction failed: keep the original voucher, pause the invalidated dispatch parts."""
+    paused = tuple(job.key for job in base.allocation.jobs if job.state in ('已分派', '候补'))
+    held = frozenset(paused)
+    rows = []
+    for row in base.report['rows']:
+        if row['key'] in held:
+            row = dict(row, state='暂停', reason='CORRECTION_INVALIDATED',
+                       evidence='估计随作废实绩失效，暂停派工等待更正重算')
+        rows.append(row)
+    states = Counter(row['state'] for row in rows)
+    spent = sum(row['cost'] for row in rows if row['state'] == '已分派')
+    report = dict(base.report)
+    report['rows'] = rows
+    report['metrics'] = [
+        {'label': '当班标线路段', 'value': len(rows)},
+        {'label': '已分派', 'value': states.get('已分派', 0)},
+        {'label': '候补', 'value': states.get('候补', 0)},
+        {'label': '暂停及人工判读', 'value': states.get('暂停', 0) + states.get('人工判读', 0)},
+        {'label': '额度结余', 'value': base.allocation.capacity - spent},
+    ]
+    report['flow_counts'] = list(states.items())
+    report['series'] = [dict(point, state='暂停') if point['label'] in held else point
+                        for point in base.report['series']]
+    return report, paused
+
+
+def correct(documents, voids, capacity=12, mode='balanced', *, as_of=96):
+    notices = correction_service.normalize_voids(voids)
+    base = _execute_run(documents, capacity, mode, as_of)
+    registrations = correction_service.locate_voids(notices, base.intake, base.windows)
+    scope = correction_service.decide_scope(registrations)
+    cleaned = correction_service.strip_voided_outcomes(documents, notices)
+    paused = ()
+    if scope == correction_contract.SCOPE_NONE:
+        run_report, corrected_stamp, status = base.report, base.receipt.stamp, correction_contract.STATUS_ISSUED
+    elif scope == correction_contract.SCOPE_REPLAY:
+        run_report, corrected_stamp = _refresh_replay(base, cleaned, mode, as_of)
+        status = correction_contract.STATUS_ISSUED
+    else:
+        try:
+            rerun = _execute_run(cleaned, capacity, mode, as_of)
+        except ValueError:
+            run_report, paused = _pause_invalidated(base)
+            corrected_stamp, status = None, correction_contract.STATUS_RETRY
+        else:
+            run_report, corrected_stamp, status = rerun.report, rerun.receipt.stamp, correction_contract.STATUS_ISSUED
+    voucher = correction_service.issue_voucher(registrations, scope, status, base.receipt.stamp,
+                                               corrected_stamp, paused,
+                                               capacity=capacity, mode=mode, as_of=as_of)
+    report = dict(run_report)
+    report['correction'] = correction_service.correction_summary(voucher)
+    sections = [dict(section) for section in report['sections']]
+    sections[7] = dict(sections[7], records=[*sections[7]['records'],
+                                             *correction_service.registration_evidence(voucher)])
+    report['sections'] = sections
+    return report
 
 
 def preview(capacity=12, mode='balanced'):

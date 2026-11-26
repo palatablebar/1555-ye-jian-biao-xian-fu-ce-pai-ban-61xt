@@ -7,7 +7,7 @@ import re
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge, UnsupportedMediaType
 
-from .pipeline import DISPLAY, MODULES, execute, open_fixture, preview
+from .pipeline import DISPLAY, MODULES, correct, execute, open_fixture, preview
 
 app = Flask(__name__, static_folder='web/static', template_folder='web/templates')
 app.config['MAX_CONTENT_LENGTH'] = 1_500_000
@@ -64,6 +64,25 @@ def run_case():
         return jsonify(code='INVALID_BATCH', message=str(issue)), 422
 
 
+@app.post('/api/linebeads/correct')
+def correct_case():
+    try:
+        posted = request.get_json()
+        if not isinstance(posted, dict) or posted.keys() - {'capacity', 'strategy', 'records', 'as_of', 'voids'}:
+            raise ValueError('请求字段无效')
+        if 'records' not in posted or 'voids' not in posted:
+            raise ValueError('更正需要同时提交 records 与 voids')
+        capacity, strategy = validate_parameters(posted.get('capacity', 12), posted.get('strategy', 'balanced'))
+        as_of = posted.get('as_of', 96)
+        if type(as_of) is not int or not 91 <= as_of <= 3650:
+            raise ValueError('截止日须在第 91 日后')
+        return jsonify(correct(posted['records'], posted['voids'], capacity, strategy, as_of=as_of))
+    except (BadRequest, UnsupportedMediaType):
+        return jsonify(code='INVALID_JSON', message='请提交 JSON 对象'), 400
+    except ValueError as issue:
+        return jsonify(code='INVALID_BATCH', message=str(issue)), 422
+
+
 @app.get('/api/linebeads/stages/<stage>')
 def stage_detail(stage):
     mapping = {slug: index for index, (slug, _) in enumerate(MODULES)}
@@ -93,6 +112,12 @@ def main():
     runner.add_argument('--strategy', choices=('balanced', 'focus'), default='balanced')
     runner.add_argument('--input', type=Path)
     runner.add_argument('--output', type=Path)
+    fixer = commands.add_parser('correct', help='登记作废实绩版次，出车前签发本班更正凭证')
+    fixer.add_argument('--input', type=Path, required=True)
+    fixer.add_argument('--voids', type=Path, required=True)
+    fixer.add_argument('--capacity', type=int, default=12)
+    fixer.add_argument('--strategy', choices=('balanced', 'focus'), default='balanced')
+    fixer.add_argument('--output', type=Path)
     server = commands.add_parser('serve', help='打开本地工作台')
     server.add_argument('--port', type=int, default=8000)
     args = parser.parse_args()
@@ -103,7 +128,12 @@ def main():
         return
     try:
         capacity, strategy = validate_parameters(args.capacity, args.strategy)
-        if args.input:
+        if args.command == 'correct':
+            custom = open_fixture(args.input)
+            notice_document = json.loads(args.voids.read_text(encoding='utf-8'))
+            voids = notice_document.get('voids') if isinstance(notice_document, dict) else notice_document
+            result = correct(custom['records'], voids, capacity, strategy, as_of=custom.get('as_of', 96))
+        elif args.input:
             custom = open_fixture(args.input)
             result = execute(custom['records'], capacity, strategy, as_of=custom.get('as_of', 96))
         else:

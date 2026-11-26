@@ -16,6 +16,7 @@ AI/ML · 传统ML · 中型
 | M6 | 季节分组 | 差异定位和外推审查 | `src/linebeads/seasonal_mix/service.py` | `tests/test_seasonal_mix.py` |
 | M7 | 复测工位 | 硬规则与额度分配 | `src/linebeads/retrocheck_slots/service.py` | `tests/test_retrocheck_slots.py` |
 | M8 | 标线留证 | 单据及额度证据 | `src/linebeads/marking_evidence/service.py` | `tests/test_marking_evidence.py` |
+| M9 | 作废更正 | 作废登记与更正凭证 | `src/linebeads/correction/service.py` | `tests/test_correction.py` |
 
 ## 深度登记
 
@@ -30,3 +31,7 @@ AI/ML · 传统ML · 中型
 | TRAP-44 | 校准样本不足 | 分派前转人工判读并保留原因 | `src/linebeads/night_accuracy/service.py` | `tests/test_night_accuracy.py::test_empty_calibration_requires_review` |
 | TRAP-53 | 单条推断与混批 | 复用冻结参数，各条估计完全一致 | `src/linebeads/bead_kernel/service.py` | `tests/test_bead_kernel.py::test_input_batch_invariance` |
 | TRAP-54 | 特征版本与模型不配对 | 拒绝继续推断并要求重拟合 | `src/linebeads/bead_kernel/service.py` | `tests/test_bead_kernel.py::test_mismatched_model_input_version_fails` |
+| TRAP-61 | 作废实绩进入拟合或校准 | 模型与校准立即停用，跨区区间一并重算 | `src/linebeads/correction/service.py` | `tests/test_correction.py::test_void_train_outcome_recomputes_model_and_cross_zone_intervals` |
+| TRAP-62 | 作废只影响回放 | 只更新回放误差，当班工位照旧 | `src/linebeads/pipeline.py` | `tests/test_correction.py::test_replay_only_void_updates_errors_and_keeps_dispatch` |
+| TRAP-63 | 更正重算失败 | 原凭证留查，失效部分暂停派工，可重试 | `src/linebeads/pipeline.py` | `tests/test_correction.py::test_failed_correction_keeps_voucher_and_pauses_invalidated` |
+| TRAP-64 | 同批重复更正 | 凭证按内容签发，重跑不新增 | `src/linebeads/correction/service.py` | `tests/test_correction.py::test_same_batch_rerun_issues_no_new_voucher` |
